@@ -1,0 +1,43 @@
+# Models (too large)
+models/
+
+# Training data and benchmark data
+data/
+data-w/
+
+# Experiment results and checkpoints
+results/
+outputs/
+logs/
+
+# LESS scores (generated artifacts)
+less/scores_maxlen8192/
+less/gpu*.log
+less/q2_analysis/
+
+# Analysis results
+analysis/results/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Core dumps
+core.*
+
+# Backup files
+*.bak.*
+
+# Figures and PDFs (not code)
+*.pdf
+figure*.png
+
+# Old pipeline scripts (superseded)
+run/
+scripts/
+tools/
+
+# Misc
+*.sh.bak

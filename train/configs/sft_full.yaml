@@ -1,0 +1,13 @@
+# Full fine-tuning hyperparameters
+# Matches Sky-T1 / Bespoke-Stratos recipe for Qwen2.5-Math-7B
+learning_rate: 1.0e-5
+num_train_epochs: 10
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 16    # 4 GPUs × 1 × 16 = 64 effective global batch
+max_seq_length: 32768
+lr_scheduler_type: cosine
+warmup_ratio: 0.05
+logging_steps: 10
+save_strategy: steps
+save_steps: 100
+save_total_limit: 3
