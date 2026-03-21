@@ -31,6 +31,10 @@ from typing import List, Optional
 import numpy as np
 import yaml
 import torch
+# Force fp32 accumulation in bf16 matmuls on A100 (no memory overhead).
+# Without this, A100 uses bf16 reduced-precision accumulators in tensor cores,
+# which can produce NaN in lm_head backward matmuls during fine-tuning.
+torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
 from torch.utils.data import Dataset as TorchDataset
 from transformers import (
     AutoTokenizer,
@@ -53,9 +57,9 @@ def apply_liger(model_type: str = "qwen2"):
                 rope=True,
                 rms_norm=True,
                 swiglu=True,
-                fused_linear_cross_entropy=True,
+                fused_linear_cross_entropy=False,  # Disabled: incompatible with sequence packing
             )
-        print("[INFO] Liger kernels applied")
+        print("[INFO] Liger kernels applied (rope/rms_norm/swiglu only)")
     except ImportError:
         print("[WARN] liger_kernel not installed, skipping")
 
@@ -179,21 +183,24 @@ class PackedSFTDataset(TorchDataset):
             raw_records.append({"input_ids": ids, "labels": lbl,
                                  "train_weight": w})
 
-        # Pack
-        self.records = pack_sequences(raw_records, max_length)
+        # Pack, then immediately convert Python lists → numpy arrays.
+        # Python lists of ints use ~36 bytes/token vs 8 bytes/token for numpy,
+        # so with 8 ranks × 6944 bins × 32768 tokens this saves ~250 GB of RAM.
+        self.records = []
+        for r in pack_sequences(raw_records, max_length):
+            self.records.append({
+                "input_ids":     np.array(r["input_ids"],     dtype=np.int64),
+                "labels":        np.array(r["labels"],        dtype=np.int64),
+                "position_ids":  np.array(r["position_ids"],  dtype=np.int64),
+                "token_weights": np.array(r["token_weights"], dtype=np.float32),
+                "length":        r["length"],
+            })
 
     def __len__(self):
         return len(self.records)
 
     def __getitem__(self, idx):
-        r = self.records[idx]
-        return {
-            "input_ids":     np.array(r["input_ids"],     dtype=np.int64),
-            "labels":        np.array(r["labels"],        dtype=np.int64),
-            "position_ids":  np.array(r["position_ids"],  dtype=np.int64),
-            "token_weights": np.array(r["token_weights"], dtype=np.float32),
-            "length":        r["length"],
-        }
+        return self.records[idx]   # already numpy — no copy needed
 
 
 # ---------------------------------------------------------------------------
@@ -288,37 +295,205 @@ class WeightedTrainer(Trainer):
     For uniform weights (all 1.0) behaviour is identical to standard Trainer.
     """
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Our compute_loss does NOT use num_items_in_batch for normalization.
+        # The base Trainer.__init__ sets self.model_accepts_loss_kwargs=True because
+        # Qwen2's forward has **kwargs. We override it to False so HF Trainer will:
+        #   1. Not compute num_items_in_batch (saves memory/compute)
+        #   2. Divide loss by gradient_accumulation_steps before backward,
+        #      so gradients are properly averaged (not summed) across micro-batches.
+        self.model_accepts_loss_kwargs = False
+
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        token_weights = inputs.pop("token_weights", None)   # (B, T)
+        token_weights = inputs.pop("token_weights", None)   # (B, T) float32, 0=pad
+        labels        = inputs.pop("labels")
 
-        if token_weights is None or (token_weights == 1.0).all():
-            outputs = model(**inputs)
-            loss = outputs.loss
-            return (loss, outputs) if return_outputs else loss
+        # Always use chunked CE to avoid materialising full logits (B, T, V)
+        # ~10 GB at seq_len=32768, vocab=152k. Liger fused_linear_cross_entropy
+        # is disabled because it is incompatible with sequence packing.
+        import torch.nn.functional as F
+        CHUNK = 512  # peak extra mem ≈ CHUNK × vocab × 2B ≈ 148 MB per chunk
 
-        # Manual weighted cross-entropy
-        labels = inputs.pop("labels")
-        outputs = model(**inputs)
-        logits  = outputs.logits                      # (B, T, V)
+        hf_model     = model.module if hasattr(model, "module") else model
+        _rank0 = (not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0)
 
-        shift_logits  = logits[..., :-1, :].contiguous()
-        shift_labels  = labels[..., 1:].contiguous()
-        shift_weights = token_weights[..., 1:].contiguous().to(logits.device)
+        # Check lm_head weight for NaN/Inf BEFORE forward pass
+        if _rank0:
+            lm_w = hf_model.lm_head.weight
+            lm_nan = lm_w.isnan().any().item() or lm_w.isinf().any().item()
+            if lm_nan or (not hasattr(self, '_debug_count') or self._debug_count < 20):
+                print(f"[WEIGHT CHECK] micro={getattr(self,'_debug_count',0)} "
+                      f"lm_head.weight: nan={lm_nan} "
+                      f"min={lm_w.float().min().item():.3e} "
+                      f"max={lm_w.float().max().item():.3e} "
+                      f"dtype={lm_w.dtype}", flush=True)
 
-        B, T, V = shift_logits.shape
-        loss_fct = torch.nn.CrossEntropyLoss(reduction="none", ignore_index=-100)
-        per_token_loss = loss_fct(
-            shift_logits.view(-1, V),
-            shift_labels.view(-1),
-        ).view(B, T)
+        position_ids = inputs.get("position_ids")
+        transformer_out = hf_model.model(
+            input_ids      = inputs["input_ids"],
+            attention_mask = inputs["attention_mask"],
+            position_ids   = position_ids,
+        )
+        hidden  = transformer_out.last_hidden_state          # (B, T, H)
+        lm_head = hf_model.lm_head
 
-        # Apply weights and normalise by number of non-masked tokens
-        non_pad = (shift_labels != -100).float()
-        weighted = per_token_loss * shift_weights * non_pad
-        denom    = (shift_weights * non_pad).sum().clamp(min=1e-8)
-        loss     = weighted.sum() / denom
+        shift_hidden  = hidden[..., :-1, :].contiguous()    # (B, T-1, H)
+        shift_labels  = labels[..., 1:].contiguous()        # (B, T-1)
 
-        return (loss, outputs) if return_outputs else loss
+        # Uniform weight = 1 for all non-padding positions when train_weight absent
+        if token_weights is not None:
+            shift_weights = token_weights[..., 1:].contiguous().to(hidden.device)
+        else:
+            shift_weights = (shift_labels != -100).float()
+
+        B, T, H = shift_hidden.shape
+        # Use float32 accumulators to avoid bfloat16 precision loss when summing
+        # thousands of per-token losses (bf16 has only ~3 decimal digits precision)
+        total_loss = torch.zeros((), device=hidden.device, dtype=torch.float32)
+        total_w    = torch.zeros((), device=hidden.device, dtype=torch.float32)
+
+        # Cast lm_head weight to fp32 ONCE before the chunk loop.
+        # This ensures the entire lm_head matmul (forward + backward) runs in fp32,
+        # so the 64-chunk gradient accumulation into lm_head.weight.grad is fp32.
+        # Without this, bf16 gradient accumulation across chunks produces NaN for
+        # dense token weights (rsr, w_mean=1.0) after just 2 optimizer steps.
+        lm_head_w = lm_head.weight.float()
+        lm_head_b = lm_head.bias.float() if lm_head.bias is not None else None
+
+        for start in range(0, T, CHUNK):
+            end          = min(start + CHUNK, T)
+            chunk_h      = shift_hidden[:, start:end, :]    # (B, chunk, H)
+            chunk_labels = shift_labels[:, start:end]       # (B, chunk)
+            chunk_w      = shift_weights[:, start:end]      # (B, chunk)
+
+            # Full fp32 matmul: input, weight, and output are all float32.
+            # Gradients for lm_head.weight will flow back through lm_head_w (fp32).
+            chunk_logits = F.linear(chunk_h.float(), lm_head_w, lm_head_b)  # (B, chunk, V) float32
+            V = chunk_logits.shape[-1]
+
+
+            chunk_ce = F.cross_entropy(
+                chunk_logits.view(-1, V),
+                chunk_labels.view(-1),
+                ignore_index=-100,
+                reduction="none",
+            ).view(B, -1)                                   # (B, chunk) float32
+
+            valid       = (chunk_labels != -100).float()
+            total_loss += (chunk_ce * chunk_w * valid).sum()
+            total_w    += (chunk_w * valid).sum()
+            del chunk_logits, chunk_ce
+
+        # ── NaN / debug tracking ────────────────────────────────────────────
+        if not hasattr(self, '_debug_count'):
+            self._debug_count = 0
+        _rank0 = (not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0)
+
+        # Always check for NaN/Inf in key tensors and report immediately
+        _nan_hidden   = hidden.isnan().any().item() or hidden.isinf().any().item()
+        _nan_loss     = total_loss.isnan().item() or total_loss.isinf().item()
+        _nan_w        = total_w.isnan().item()  or total_w.isinf().item()
+        _nan_weights  = (shift_weights.isnan().any().item() or shift_weights.isinf().any().item()
+                         if token_weights is not None else False)
+
+        if _rank0 and (_nan_hidden or _nan_loss or _nan_w or _nan_weights):
+            print(f"[NaN ALERT] step={self._debug_count} "
+                  f"hidden_nan={_nan_hidden} total_loss={total_loss.item()} "
+                  f"total_w={total_w.item()} weights_nan={_nan_weights} "
+                  f"B={B} T={T} hidden.dtype={hidden.dtype}", flush=True)
+            # Extra: check hidden stats (min/max to catch Inf)
+            h_f = hidden.float()
+            print(f"[NaN ALERT] hidden: min={h_f.min().item():.3e} max={h_f.max().item():.3e} "
+                  f"mean={h_f.mean().item():.3e}", flush=True)
+
+        # Verbose for first 20 micro-batches (enough to cover first global step + a few)
+        if _rank0 and self._debug_count < 20:
+            tw = total_w.item()
+            tl = total_loss.item()
+            ratio = tl / tw if tw > 0 else float('inf')
+            print(f"[DEBUG] micro={self._debug_count} total_loss={tl:.4f} total_w={tw:.4f} "
+                  f"loss={ratio:.4f} B={B} T={T} "
+                  f"valid_frac={(shift_labels != -100).float().mean().item():.3f} "
+                  f"w_mean={shift_weights.float().mean().item():.4f} "
+                  f"hidden_dtype={hidden.dtype}", flush=True)
+        self._debug_count += 1
+        # ── end debug ────────────────────────────────────────────────────────
+
+        # Safe division: avoid gradient explosion (1/1e-8 = 1e8) when total_w≈0
+        if total_w.item() > 0:
+            loss = total_loss / total_w
+        else:
+            loss = total_loss * 0.0  # zero loss, zero gradient for all-padding batches
+        return (loss, None) if return_outputs else loss
+
+    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
+        # Fully override to avoid HF's `logits = outputs[1:]` which crashes when
+        # compute_loss returns (loss, None) from the chunked weighted CE path.
+        inputs = self._prepare_inputs(inputs)
+        with torch.no_grad():
+            with self.compute_loss_context_manager():
+                loss = self.compute_loss(model, inputs, return_outputs=False)
+            loss = loss.mean().detach()
+        return (loss, None, None)
+
+    def _save_checkpoint(self, model, trial, metrics=None):
+        """
+        Completely custom save: model weights only, rank 0 only.
+        Never calls super() to avoid DeepSpeed saving optimizer states
+        (which would require ~45 GB of CPU RAM and cause SIGKILL OOM).
+        """
+        import gc, os
+        from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
+        run_dir = self._get_output_dir(trial=trial)
+        output_dir = os.path.join(run_dir, checkpoint_folder)
+
+        # Sync all ranks before any I/O
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.barrier()
+
+        # Only rank 0 writes — other ranks just wait at the barrier above
+        if self.args.process_index == 0:
+            os.makedirs(output_dir, exist_ok=True)
+
+            # Unwrap DeepSpeedEngine → underlying HF model
+            hf_model = self.accelerator.unwrap_model(self.model)
+
+            # safe_serialization=True: safetensors streams GPU tensors to disk
+            # one at a time (~1 GB peak CPU RAM, not 15 GB full state_dict copy)
+            hf_model.save_pretrained(output_dir, safe_serialization=True)
+
+            if self.tokenizer is not None:
+                self.tokenizer.save_pretrained(output_dir)
+
+            # trainer_state.json is required by resume_from_checkpoint
+            self.state.save_to_json(os.path.join(output_dir, "trainer_state.json"))
+
+        # All ranks wait for rank 0 to finish before continuing training
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.barrier()
+
+        # Rotate old checkpoints (rank 0 only)
+        if self.args.process_index == 0:
+            self._rotate_checkpoints(use_mtime=False, output_dir=run_dir)
+
+
+# ---------------------------------------------------------------------------
+# Step-1 checkpoint callback: save once at step 1 to verify saving works,
+# then let the normal save_steps schedule take over.
+# ---------------------------------------------------------------------------
+
+class SaveAtStep1Callback(TrainerCallback):
+    """Saves a checkpoint after the very first optimizer step."""
+    def on_step_end(self, args, state, control, **kwargs):
+        if state.global_step == 1:
+            control.should_save = True
+        return control
 
 
 # ---------------------------------------------------------------------------
@@ -334,24 +509,9 @@ class LossPlotCallback(TrainerCallback):
         os.makedirs(output_dir, exist_ok=True)
 
     def on_train_begin(self, args, state, control, model=None, **kwargs):
-        if int(os.environ.get("LOCAL_RANK", 0)) != 0:
-            return
-        try:
-            indices = random.sample(range(len(self.train_dataset)),
-                                    min(self.n_init_samples, len(self.train_dataset)))
-            samples = [self.train_dataset[i] for i in indices]
-            batch   = self.data_collator(samples)
-            batch   = {k: v.to(model.device) for k, v in batch.items()}
-            model.eval()
-            with torch.no_grad():
-                # temporarily remove token_weights for step-0 loss
-                batch.pop("token_weights", None)
-                loss = model(**batch).loss.item()
-            model.train()
-            state.log_history.insert(0, {"step": 0, "loss": loss})
-            print(f"[INFO] step 0 train loss = {loss:.4f}")
-        except Exception as e:
-            print(f"[WARN] step-0 train loss failed: {e}")
+        # Disabled: ZeRO-3 requires all ranks to participate in forward pass simultaneously.
+        # Single-rank forward in on_train_begin causes NCCL deadlock.
+        pass
 
     def on_evaluate(self, args, state, control, **kwargs):
         if int(os.environ.get("LOCAL_RANK", 0)) == 0:
@@ -418,6 +578,7 @@ def main():
     ap.add_argument("--aime_data",   type=str,   default=None)
     ap.add_argument("--eval_steps",  type=int,   default=10)
     ap.add_argument("--no_liger",    action="store_true", help="Disable Liger kernels")
+    ap.add_argument("--local_rank",  type=int, default=-1, help="Local rank (injected by DeepSpeed/torchrun)")
     args = ap.parse_args()
 
     configs_dir = Path(__file__).parent / "configs"
@@ -506,6 +667,7 @@ def main():
         save_strategy=sft_cfg.get("save_strategy", "steps"),
         save_steps=sft_cfg.get("save_steps", 100),
         save_total_limit=sft_cfg.get("save_total_limit", 3),
+        save_only_model=sft_cfg.get("save_only_model", True),
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
         dataloader_num_workers=0,
@@ -513,10 +675,11 @@ def main():
         group_by_length=True,
         length_column_name="length",
         report_to="none",
+        logging_nan_inf_filter=False,  # Don't silently replace NaN/Inf with old loss — show it clearly
         deepspeed=ds_path,
         eval_strategy="steps" if eval_dataset is not None else "no",
         eval_steps=args.eval_steps if eval_dataset is not None else None,
-        eval_on_start=eval_dataset is not None,
+        eval_on_start=False,  # Disabled: causes NCCL deadlock with ZeRO-3
         per_device_eval_batch_size=1,
     )
 
@@ -535,13 +698,19 @@ def main():
         eval_dataset=eval_dataset,
         data_collator=data_collator,
         tokenizer=tokenizer,
-        callbacks=[LossPlotCallback(args.output_dir, dataset, data_collator)],
+        callbacks=[SaveAtStep1Callback(), LossPlotCallback(args.output_dir, dataset, data_collator)],
     )
 
-    # Resume from checkpoint if available
+    # Resume from the latest *complete* checkpoint (must have trainer_state.json)
     import glob
     ckpt_dirs = sorted(glob.glob(os.path.join(args.output_dir, "checkpoint-*")))
-    resume = ckpt_dirs[-1] if ckpt_dirs else None
+    resume = None
+    for d in reversed(ckpt_dirs):
+        if os.path.exists(os.path.join(d, "trainer_state.json")):
+            resume = d
+            break
+        else:
+            print(f"[WARN] skipping incomplete checkpoint (no trainer_state.json): {d}")
     if resume:
         print(f"[INFO] resuming from {resume}")
     trainer.train(resume_from_checkpoint=resume)
